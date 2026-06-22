@@ -68,11 +68,28 @@ class AIDOFORYOU_Endpoint_Extract extends AIDOFORYOU_Metadata_Endpoint_Base {
             if ( (int) $files['image']['size'] > $max_bytes ) {
                 return new WP_Error( 'file_too_large', __( 'Image exceeds the maximum allowed file size.', 'aidoforyou-metadata' ), array( 'status' => 400 ) );
             }
+            
             $file_path = $files['image']['tmp_name'];
-            $mime_type = $files['image']['type'] ?? 'image/jpeg';
+            
+            // SECURITY ENHANCEMENT: Server-side MIME validation (Rejecting spoofed headers)
+            if ( function_exists( 'finfo_open' ) ) {
+                $finfo = finfo_open( FILEINFO_MIME_TYPE );
+                $mime_type = finfo_file( $finfo, $file_path );
+                finfo_close( $finfo );
+            } elseif ( function_exists( 'mime_content_type' ) ) {
+                $mime_type = mime_content_type( $file_path );
+            } else {
+                $wp_filetype = wp_check_filetype( $files['image']['name'] );
+                $mime_type = $wp_filetype['type'];
+            }
+
+            $allowed_mimes = array( 'image/jpeg', 'image/png', 'image/webp' );
+            if ( empty( $mime_type ) || ! in_array( $mime_type, $allowed_mimes, true ) ) {
+                @unlink( $file_path );
+                return new WP_Error( 'invalid_file_type', __( 'Invalid image format. Please upload a valid JPG, PNG, or WEBP image.', 'aidoforyou-metadata' ), array( 'status' => 400 ) );
+            }
         }
 
-        // PENERIMAAN INDEX SERVER DARI FRONTEND
         $server_index = (int) $request->get_param( 'server_index' );
 
         $failed_models_json = $request->get_param( 'failed_models' );
@@ -80,43 +97,16 @@ class AIDOFORYOU_Endpoint_Extract extends AIDOFORYOU_Metadata_Endpoint_Base {
         if ( ! is_array( $failed_models ) ) $failed_models = array();
         
         $user_generation_prompt = sanitize_textarea_field( $request->get_param( 'prompt' ) );
-		$user_rules = get_option( 'afy_meta_system_prompt', '' );
+        $user_rules = get_option( 'afy_meta_system_prompt', '' );
 
-		$hardcoded_json_instruction = <<<PROMPT
-		output:
-		  json_only: true
-		  single_root_object: true
-		  extra_text: false
-		  extra_keys: false
-
-		required_fields:
-		  - reverse_prompt
-		  - commercial_positioning
-		  - commercial_elasticity
-		  - media_type
-		  - filename
-		  - category
-		  - title
-		  - keywords
-		  - variation_prompts
-
-		variation_prompts:
-		  array_items_require:
-			- market_niche
-			- rationale
-			- prompt
-		  count_matches_commercial_elasticity: true
-		PROMPT;
-
-		$final_system_instruction =
-			"--- CONTENT RULES ---\n\n" .
-			$user_rules .
-			"\n\n--- STRUCTURED OUTPUT INSTRUCTIONS ---\n\n" .
-			$hardcoded_json_instruction;
+        // ARCHITECTURE ENHANCEMENT: Removed hardcoded JSON string coercion.
+        // The Master System Prompt (YAML) is now passed purely to the API.
+        // Gemini 3.5 native Structured Outputs (handled in class-gemini-client.php) takes full control.
+        $final_system_instruction = trim( $user_rules );
         
         $thinking_level = ! empty( $selected_model_data['thinking'] ) ? $selected_model_data['thinking'] : '';
 
-        // Eksekusi API menggunakan Server (API Key) spesifik
+        // Execute extraction
         $ai_response = $this->client->extract_metadata( $file_path, $mime_type, $text_input, $final_system_instruction, $user_generation_prompt, $selected_model_data['id'], $thinking_level, $server_index );
 
         if ( $has_image ) { @unlink( $file_path ); }
@@ -133,7 +123,7 @@ class AIDOFORYOU_Endpoint_Extract extends AIDOFORYOU_Metadata_Endpoint_Base {
 
             if ( $is_busy || $is_quota || $is_timeout ) {
                 
-                // 1. ROTASI SERVER (API KEY) TERLEBIH DAHULU!
+                // 1. ROTATE SERVER (API KEY) FIRST
                 $total_keys = $this->client->get_api_keys_count();
                 if ( $server_index + 1 < $total_keys ) {
                     return rest_ensure_response( array(
@@ -142,7 +132,7 @@ class AIDOFORYOU_Endpoint_Extract extends AIDOFORYOU_Metadata_Endpoint_Base {
                     ) );
                 }
 
-                // 2. JIKA SEMUA SERVER HABIS, BARU TAWARKAN MODEL LAIN (FALLBACK MODEL)
+                // 2. IF ALL SERVERS EXHAUSTED, FALLBACK TO OTHER MODELS
                 $failed_models[] = $selected_model_data['id'];
                 $available_fallbacks = array();
                 
